@@ -1,60 +1,52 @@
-from keep_alive import keep_alive
-keep_alive()
-import discord
 import os
+import json
+import discord
+from flask import Flask
+import threading
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from discord.ext import commands
-from datetime import datetime
-from pytz import timezone
 
-# Discord client setup
-intents = discord.Intents.default()
-intents.members = True  # Enable tracking of member updates (joins and leaves)
-intents.message_content = True  # Enable privileged intents for message content
+# --- Flask Web Server Setup ---
+app = Flask('')
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+@app.route('/')
+def home():
+    return "Bot is running!"
 
-# Google Sheets API setup
-scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+def run():
+    app.run(host='0.0.0.0', port=10000)
+
+def keep_alive():
+    thread = threading.Thread(target=run)
+    thread.start()
+
+# --- Google Sheets Setup ---
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+creds_json = json.loads(os.environ['GOOGLE_CREDS'])  # Loads creds from environment variable
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
 client = gspread.authorize(creds)
+sheet = client.open("Employee Time Log").sheet1  # Make sure this name matches your spreadsheet
 
-# Open your Google Sheet
-sheet = client.open("Employee Time Log").sheet1  # Replace with your sheet name
+# --- Discord Bot Setup ---
+intents = discord.Intents.default()
+intents.message_content = True
+client_bot = discord.Client(intents=intents)
 
-# Track daily clock-ins
-daily_clock_ins = {}
-
-@bot.event
+@client_bot.event
 async def on_ready():
-    print(f'Bot is online as {bot.user.name}')
-    print('Ready to track voice channel activity!')
+    print(f'Logged in as {client_bot.user}')
 
-@bot.event
-async def on_voice_state_update(member, before, after):
-    # Ensure the member is not a bot
-    if member.bot:
+@client_bot.event
+async def on_message(message):
+    if message.author == client_bot.user:
         return
 
-    # Only handle Clock In when joining voice channel
-    if before.channel != after.channel and after.channel is not None:
-        ph_tz = timezone('Asia/Manila')
-        current_date = datetime.now(ph_tz).strftime("%Y-%m-%d")
-        
-        # Check if user already clocked in today
-        if member.name not in daily_clock_ins or daily_clock_ins[member.name] != current_date:
-            timestamp = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
-            sheet.append_row([member.name, 'Clock In', timestamp])
-            daily_clock_ins[member.name] = current_date
-            print(f'{member.name} Clock In at {timestamp}')
+    if message.content.startswith('!log'):
+        username = str(message.author)
+        timestamp = str(message.created_at)
+        sheet.append_row([username, timestamp])
+        await message.channel.send(f"{username}, your log has been recorded at {timestamp}.")
 
-@bot.command()
-async def clockout(ctx):
-    ph_tz = timezone('Asia/Manila')
-    timestamp = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
-    sheet.append_row([ctx.author.name, 'Clock Out', timestamp])
-    await ctx.send(f'{ctx.author.mention} has clocked out at {timestamp}')
-    print(f'{ctx.author.name} Clock Out at {timestamp}')
-
-bot.run('MTM3Mjg5MTk2OTMzNjExOTM1OA.GrMIW7.Fb5adfqoggEyjF2x3y9OHughFBF330zBOHbM3g')
+# --- Start Everything ---
+keep_alive()
+client_bot.run(os.environ['MTM3Mjg5MTk2OTMzNjExOTM1OA.GrMIW7.Fb5adfqoggEyjF2x3y9OHughFBF330zBOHbM3g'])
