@@ -105,4 +105,4 @@ async def clockout(ctx):
 # Start keep_alive server and bot
 if __name__ == '__main__':
     keep_alive()
-    bot.run(os.environ['MTM3Mjg5MTk2OTMzNjExOTM1OA.GrMIW7.Fb5adfqoggEyjF2x3y9OHughFBF330zBOHbM3g'])  # Make sure DISCORD_TOKEN is set in your environment variables
+    bot.run(os.environ['DISCORD_TOKEN'])
