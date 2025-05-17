@@ -2,8 +2,6 @@ import os
 import json
 from flask import Flask, make_response, request
 from threading import Thread
-from functools import wraps
-import time
 import discord
 from discord.ext import commands
 import gspread
@@ -13,35 +11,6 @@ from pytz import timezone
 
 # ----- Keep Alive Server -----
 app = Flask('')
-request_count = {}
-RATE_LIMIT = 10  # requests
-RATE_TIME = 60   # seconds
-
-def rate_limit(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        now = time.time()
-        ip = request.remote_addr
-        if ip in request_count:
-            if now - request_count[ip]['time'] >= RATE_TIME:
-                request_count[ip] = {'count': 1, 'time': now}
-            elif request_count[ip]['count'] >= RATE_LIMIT:
-                return 'Rate limit exceeded', 429
-            else:
-                request_count[ip]['count'] += 1
-        else:
-            request_count[ip] = {'count': 1, 'time': now}
-        return f(*args, **kwargs)
-    return decorated_function
-
-@app.route('/')
-@rate_limit
-def home():
-    response = make_response("I'm alive!")
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    return response
 
 def run():
     app.run(host='0.0.0.0', port=8080)
@@ -59,13 +28,13 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Google Sheets API scope
 scope = [
-    "https://spreadsheets.google.com/feeds", 
-    'https://www.googleapis.com/auth/spreadsheets', 
+    "https://spreadsheets.google.com/feeds",
+    'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
 ]
 
 # Load Google credentials from environment variable
-creds_json = json.loads(os.environ['GOOGLE_CREDS'])
+creds_json = json.loads(os.environ['GOOGLE_CREDS'])  # Set in your environment
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
 client = gspread.authorize(creds)
 
@@ -102,7 +71,7 @@ async def clockout(ctx):
     await ctx.send(f'{ctx.author.mention} has clocked out at {timestamp}')
     print(f'{ctx.author.name} Clock Out at {timestamp}')
 
-# Start keep_alive server and bot
+# Start the keep_alive server and bot
 if __name__ == '__main__':
     keep_alive()
-    bot.run(os.environ['DISCORD_TOKEN'])
+    bot.run(os.environ['DISCORD_TOKEN'])  # Make sure DISCORD_TOKEN is set in your environment
