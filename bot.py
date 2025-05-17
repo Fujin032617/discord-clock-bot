@@ -43,6 +43,16 @@ sheet = client.open("Employee Time Log").sheet1
 
 daily_clock_ins = {}
 
+# ----- Flask Route -----
+@app.route('/')
+def home():
+    response = make_response("I'm alive!")
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    return response
+
+# ----- Discord Bot Events -----
 @bot.event
 async def on_ready():
     print(f'Bot is online as {bot.user.name}')
@@ -63,6 +73,7 @@ async def on_voice_state_update(member, before, after):
             daily_clock_ins[member.name] = current_date
             print(f'{member.name} Clock In at {timestamp}')
 
+# ----- Command to Clock Out -----
 @bot.command()
 async def clockout(ctx):
     ph_tz = timezone('Asia/Manila')
