@@ -9,8 +9,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 from pytz import timezone
 
-# File path for excluded users data
+# File paths for data
 EXCLUDED_USERS_FILE = 'excluded_users.json'
+DAILY_CLOCK_INS_FILE = 'daily_clock_ins.json' # New file for persistent clock-ins
 
 def load_excluded_users():
     if os.path.exists(EXCLUDED_USERS_FILE):
@@ -25,6 +26,30 @@ def load_excluded_users():
 def save_excluded_users(user_ids):
     with open(EXCLUDED_USERS_FILE, 'w') as f:
         json.dump({'user_ids': user_ids}, f, indent=4)
+
+# New functions for persistent daily clock-ins
+def load_daily_clock_ins():
+    if os.path.exists(DAILY_CLOCK_INS_FILE):
+        with open(DAILY_CLOCK_INS_FILE, 'r') as f:
+            try:
+                data = json.load(f)
+                # Ensure we only load for the current date to prevent stale entries
+                ph_tz = timezone('Asia/Manila')
+                current_date_str = datetime.now(ph_tz).strftime("%Y-%m-%d")
+                # Filter out old entries, keep only entries for the current date
+                filtered_data = {
+                    user_id: date_str
+                    for user_id, date_str in data.items()
+                    if date_str == current_date_str
+                }
+                return filtered_data
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+def save_daily_clock_ins(clock_ins_data):
+    with open(DAILY_CLOCK_INS_FILE, 'w') as f:
+        json.dump(clock_ins_data, f, indent=4)
 
 app = Flask('')
 
@@ -53,7 +78,8 @@ client = gspread.authorize(creds)
 
 sheet = client.open("Employee Time Log").sheet1
 
-daily_clock_ins = {}
+# Load daily clock-ins at startup
+daily_clock_ins = load_daily_clock_ins()
 
 excluded_user_ids = load_excluded_users()
 
@@ -74,19 +100,20 @@ async def on_ready():
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
-    
+
     if member.id in excluded_user_ids:
         return
 
-    if before.channel != after.channel and after.channel is not None:
-        ph_tz = timezone('Asia/Manila')
-        current_date = datetime.now(ph_tz).strftime("%Y-%m-%d")
+    ph_tz = timezone('Asia/Manila')
+    current_date = datetime.now(ph_tz).strftime("%Y-%m-%d")
 
-        if member.name not in daily_clock_ins or daily_clock_ins[member.name] != current_date:
-            timestamp = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
-            sheet.append_row([member.name, 'Clock In', timestamp])
-            daily_clock_ins[member.name] = current_date
-            print(f'{member.name} Clock In at {timestamp}')
+    # Check using member.id for uniqueness and current date
+    if str(member.id) not in daily_clock_ins or daily_clock_ins[str(member.id)] != current_date:
+        timestamp = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([member.name, 'Clock In', timestamp]) # Still log with member.name for readability in sheet
+        daily_clock_ins[str(member.id)] = current_date # Store member.id as string key
+        save_daily_clock_ins(daily_clock_ins) # Save after each clock-in
+        print(f'{member.name} (ID: {member.id}) Clock In at {timestamp}')
 
 @bot.command()
 async def clockout(ctx):
