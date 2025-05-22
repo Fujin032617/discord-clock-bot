@@ -34,7 +34,7 @@ scope = [
 ]
 
 # Load Google credentials from environment variable
-creds_json = json.loads(os.environ['GOOGLE_CREDS'])  # Set in your environment
+creds_json = json.loads(os.environ['GOOGLE_CREDS'])
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
 client = gspread.authorize(creds)
 
@@ -42,6 +42,13 @@ client = gspread.authorize(creds)
 sheet = client.open("Employee Time Log").sheet1
 
 daily_clock_ins = {}
+
+# Load excluded user IDs
+# Ensure EXCLUDED_USER_IDS is set as an environment variable (e.g., "ID1,ID2,ID3")
+# If not set, it will be an empty list.
+excluded_user_ids_str = os.environ.get('EXCLUDED_USER_IDS', '')
+excluded_user_ids = [int(uid.strip()) for uid in excluded_user_ids_str.split(',') if uid.strip()]
+
 
 # ----- Flask Route -----
 @app.route('/')
@@ -62,6 +69,12 @@ async def on_ready():
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
+    
+    # --- New check to exclude specific users ---
+    if member.id in excluded_user_ids:
+        print(f"Ignoring voice state update for excluded user: {member.name} ({member.id})")
+        return
+    # ------------------------------------------
 
     if before.channel != after.channel and after.channel is not None:
         ph_tz = timezone('Asia/Manila')
@@ -76,6 +89,12 @@ async def on_voice_state_update(member, before, after):
 # ----- Command to Clock Out -----
 @bot.command()
 async def clockout(ctx):
+    # --- New check to exclude specific users from clockout command if desired ---
+    if ctx.author.id in excluded_user_ids:
+        await ctx.send(f'{ctx.author.mention}, you are not eligible for time tracking.')
+        return
+    # --------------------------------------------------------------------------
+
     ph_tz = timezone('Asia/Manila')
     timestamp = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
     sheet.append_row([ctx.author.name, 'Clock Out', timestamp])
@@ -85,4 +104,4 @@ async def clockout(ctx):
 # Start the keep_alive server and bot
 if __name__ == '__main__':
     keep_alive()
-    bot.run(os.environ['DISCORD_TOKEN'])  # Make sure DISCORD_TOKEN is set in your environment
+    bot.run(os.environ['DISCORD_TOKEN'])
