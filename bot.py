@@ -11,6 +11,7 @@ from pytz import timezone
 
 EXCLUDED_USERS_FILE = 'excluded_users.json'
 ACTIVE_SHIFTS_FILE = 'active_shifts.json'
+LAST_CLOCKOUT_FILE = 'last_clockout.json'
 
 # Flask App Setup
 app = Flask('')
@@ -56,6 +57,12 @@ def load_active_shifts():
 def save_active_shifts(data):
     save_json_file(ACTIVE_SHIFTS_FILE, data)
 
+def load_last_clockouts():
+    return load_json_file(LAST_CLOCKOUT_FILE, {})
+
+def save_last_clockouts(data):
+    save_json_file(LAST_CLOCKOUT_FILE, data)
+
 # Discord Setup
 intents = discord.Intents.default()
 intents.members = True
@@ -77,6 +84,7 @@ sheet = client.open("Employee Time Log").sheet1
 # Load Data
 excluded_user_ids = load_excluded_users()
 active_shifts = load_active_shifts()
+last_clockouts = load_last_clockouts()
 
 @bot.event
 async def on_ready():
@@ -88,17 +96,25 @@ async def on_ready():
 async def on_voice_state_update(member, before, after):
     if member.bot or member.id in excluded_user_ids:
         return
-    if before.channel == after.channel:
-        return
+    if before.channel is not None or after.channel is None:
+        return  # Only trigger on join
 
     ph_tz = timezone('Asia/Manila')
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
     user_id_str = str(member.id)
 
+    # Check last clockout
+    if user_id_str in last_clockouts:
+        last_out_time = datetime.strptime(last_clockouts[user_id_str], "%Y-%m-%d %H:%M:%S")
+        last_out_time = ph_tz.localize(last_out_time)
+        if (now - last_out_time) < timedelta(minutes=15):
+            print(f"{member.name} tried to Clock In too soon after Clock Out.")
+            return
+
+    # Check last clock in
     previous_entry = active_shifts.get(user_id_str)
     allow_clock_in = False
-
     if previous_entry:
         last_clock_in_time = datetime.strptime(previous_entry['timestamp'], "%Y-%m-%d %H:%M:%S")
         last_clock_in_time = ph_tz.localize(last_clock_in_time)
@@ -123,7 +139,8 @@ async def clockout(ctx):
         return
 
     ph_tz = timezone('Asia/Manila')
-    timestamp = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(ph_tz)
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     sheet.append_row([ctx.author.name, 'Clock Out', timestamp])
     await ctx.send(f'{ctx.author.mention} has clocked out at {timestamp}')
     print(f'{ctx.author.name} Clock Out at {timestamp}')
@@ -132,6 +149,8 @@ async def clockout(ctx):
     if user_id_str in active_shifts:
         del active_shifts[user_id_str]
         save_active_shifts(active_shifts)
+    last_clockouts[user_id_str] = timestamp
+    save_last_clockouts(last_clockouts)
 
 @bot.command(name='exclude')
 @commands.has_permissions(administrator=True)
@@ -190,7 +209,7 @@ async def public_clockout_reminder():
         general_channel = discord.utils.get(guild.text_channels, name='general')
         if general_channel:
             try:
-                await general_channel.send("⏰ Friendly reminder: Don't forget to clock out after your shift. Anyone who doesn't clock out will be marked as absent! -HRJEL ")
+                await general_channel.send("\u23f0 Friendly reminder: Don't forget to clock out after your shift. Anyone who doesn't clock out will be marked as absent! -HRJEL ")
             except Exception as e:
                 print(f"Failed to send reminder in {guild.name}: {e}")
         else:
