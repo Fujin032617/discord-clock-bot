@@ -82,6 +82,7 @@ active_shifts = load_active_shifts()
 async def on_ready():
     print(f'Bot is online as {bot.user.name}')
     cleanup_old_shifts.start()
+    public_clockout_reminder.start()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -181,6 +182,19 @@ async def cleanup_old_shifts():
     if expired:
         save_active_shifts(active_shifts)
         print(f"Cleaned up {len(expired)} expired shift entries.")
+
+# Reminder to clock out every 8 hours in general channels
+@tasks.loop(hours=8)
+async def public_clockout_reminder():
+    for guild in bot.guilds:
+        general_channel = discord.utils.get(guild.text_channels, name='general')
+        if general_channel:
+            try:
+                await general_channel.send("⏰ Friendly reminder: Don't forget to clock out after your shift. Anyone who doesn't clock out will be marked as absent! -HRJEL ")
+            except Exception as e:
+                print(f"Failed to send reminder in {guild.name}: {e}")
+        else:
+            print(f"No #general channel found in {guild.name}")
 
 if __name__ == '__main__':
     keep_alive()
