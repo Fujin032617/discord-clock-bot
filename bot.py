@@ -1,56 +1,18 @@
 import os
 import json
-from flask import Flask, make_response, request
+from flask import Flask, make_response
 from threading import Thread
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from datetime import datetime, timedelta
 from pytz import timezone
 
-# File paths for data
 EXCLUDED_USERS_FILE = 'excluded_users.json'
-DAILY_CLOCK_INS_FILE = 'daily_clock_ins.json' # New file for persistent clock-ins
+ACTIVE_SHIFTS_FILE = 'active_shifts.json'
 
-def load_excluded_users():
-    if os.path.exists(EXCLUDED_USERS_FILE):
-        with open(EXCLUDED_USERS_FILE, 'r') as f:
-            try:
-                data = json.load(f)
-                return data.get('user_ids', [])
-            except json.JSONDecodeError:
-                return []
-    return []
-
-def save_excluded_users(user_ids):
-    with open(EXCLUDED_USERS_FILE, 'w') as f:
-        json.dump({'user_ids': user_ids}, f, indent=4)
-
-# New functions for persistent daily clock-ins
-def load_daily_clock_ins():
-    if os.path.exists(DAILY_CLOCK_INS_FILE):
-        with open(DAILY_CLOCK_INS_FILE, 'r') as f:
-            try:
-                data = json.load(f)
-                # Ensure we only load for the current date to prevent stale entries
-                ph_tz = timezone('Asia/Manila')
-                current_date_str = datetime.now(ph_tz).strftime("%Y-%m-%d")
-                # Filter out old entries, keep only entries for the current date
-                filtered_data = {
-                    user_id: date_str
-                    for user_id, date_str in data.items()
-                    if date_str == current_date_str
-                }
-                return filtered_data
-            except json.JSONDecodeError:
-                return {}
-    return {}
-
-def save_daily_clock_ins(clock_ins_data):
-    with open(DAILY_CLOCK_INS_FILE, 'w') as f:
-        json.dump(clock_ins_data, f, indent=4)
-
+# Flask App Setup
 app = Flask('')
 
 def run():
@@ -60,29 +22,6 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
-]
-
-creds_json = json.loads(os.environ['GOOGLE_CREDS'])
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
-client = gspread.authorize(creds)
-
-sheet = client.open("Employee Time Log").sheet1
-
-# Load daily clock-ins at startup
-daily_clock_ins = load_daily_clock_ins()
-
-excluded_user_ids = load_excluded_users()
-
 @app.route('/')
 def home():
     response = make_response("I'm alive!")
@@ -91,29 +30,90 @@ def home():
     response.headers['X-XSS-Protection'] = '1; mode=block'
     return response
 
+# Load/save functions
+def load_json_file(filepath, default):
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return default
+    return default
+
+def save_json_file(filepath, data):
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def load_excluded_users():
+    return load_json_file(EXCLUDED_USERS_FILE, [])
+
+def save_excluded_users(user_ids):
+    save_json_file(EXCLUDED_USERS_FILE, user_ids)
+
+def load_active_shifts():
+    return load_json_file(ACTIVE_SHIFTS_FILE, {})
+
+def save_active_shifts(data):
+    save_json_file(ACTIVE_SHIFTS_FILE, data)
+
+# Discord Setup
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Google Sheets Setup
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+creds_json = json.loads(os.environ['GOOGLE_CREDS'])
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+client = gspread.authorize(creds)
+sheet = client.open("Employee Time Log").sheet1
+
+# Load Data
+excluded_user_ids = load_excluded_users()
+active_shifts = load_active_shifts()
+
 @bot.event
 async def on_ready():
     print(f'Bot is online as {bot.user.name}')
-    print('Ready to track voice channel activity!')
+    cleanup_old_shifts.start()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if member.bot:
+    if member.bot or member.id in excluded_user_ids:
         return
-
-    if member.id in excluded_user_ids:
+    if before.channel == after.channel:
         return
 
     ph_tz = timezone('Asia/Manila')
-    current_date = datetime.now(ph_tz).strftime("%Y-%m-%d")
+    now = datetime.now(ph_tz)
+    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    user_id_str = str(member.id)
 
-    # Check using member.id for uniqueness and current date
-    if str(member.id) not in daily_clock_ins or daily_clock_ins[str(member.id)] != current_date:
-        timestamp = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
-        sheet.append_row([member.name, 'Clock In', timestamp]) # Still log with member.name for readability in sheet
-        daily_clock_ins[str(member.id)] = current_date # Store member.id as string key
-        save_daily_clock_ins(daily_clock_ins) # Save after each clock-in
-        print(f'{member.name} (ID: {member.id}) Clock In at {timestamp}')
+    previous_entry = active_shifts.get(user_id_str)
+    allow_clock_in = False
+
+    if previous_entry:
+        last_clock_in_time = datetime.strptime(previous_entry['timestamp'], "%Y-%m-%d %H:%M:%S")
+        last_clock_in_time = ph_tz.localize(last_clock_in_time)
+        if (now - last_clock_in_time) >= timedelta(hours=14):
+            allow_clock_in = True
+    else:
+        allow_clock_in = True
+
+    if allow_clock_in:
+        sheet.append_row([member.name, 'Clock In', timestamp_str])
+        active_shifts[user_id_str] = {
+            'date': now.strftime("%Y-%m-%d"),
+            'timestamp': timestamp_str
+        }
+        save_active_shifts(active_shifts)
+        print(f'{member.name} Clock In at {timestamp_str}')
 
 @bot.command()
 async def clockout(ctx):
@@ -127,69 +127,60 @@ async def clockout(ctx):
     await ctx.send(f'{ctx.author.mention} has clocked out at {timestamp}')
     print(f'{ctx.author.name} Clock Out at {timestamp}')
 
+    user_id_str = str(ctx.author.id)
+    if user_id_str in active_shifts:
+        del active_shifts[user_id_str]
+        save_active_shifts(active_shifts)
+
 @bot.command(name='exclude')
 @commands.has_permissions(administrator=True)
 async def exclude_user(ctx, member: discord.Member):
-    """Excludes a user from time tracking. Usage: !exclude @User or !exclude UserID"""
     global excluded_user_ids
-
     if member.id in excluded_user_ids:
         await ctx.send(f'{member.mention} is already in the exclusion list.')
-        return
-
-    excluded_user_ids.append(member.id)
-    save_excluded_users(excluded_user_ids)
-    await ctx.send(f'{member.mention} has been added to the exclusion list and will no longer be tracked.')
-
-@exclude_user.error
-async def exclude_user_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You don't have the necessary permissions (Administrator) to use this command.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("Please provide a valid user to exclude (mention them or provide their ID). Example: `!exclude @JohnDoe` or `!exclude 123456789012345678`")
     else:
-        await ctx.send(f"An error occurred: {error}")
+        excluded_user_ids.append(member.id)
+        save_excluded_users(excluded_user_ids)
+        await ctx.send(f'{member.mention} has been excluded from time tracking.')
 
 @bot.command(name='unexclude')
 @commands.has_permissions(administrator=True)
 async def unexclude_user(ctx, member: discord.Member):
-    """Removes a user from time tracking exclusion. Usage: !unexclude @User or !unexclude UserID"""
     global excluded_user_ids
-
     if member.id not in excluded_user_ids:
         await ctx.send(f'{member.mention} is not in the exclusion list.')
-        return
-
-    excluded_user_ids.remove(member.id)
-    save_excluded_users(excluded_user_ids)
-    await ctx.send(f'{member.mention} has been removed from the exclusion list and will now be tracked.')
-
-@unexclude_user.error
-async def unexclude_user_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You don't have the necessary permissions (Administrator) to use this command.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("Please provide a valid user to unexclude (mention them or provide their ID). Example: `!unexclude @JohnDoe` or `!unexclude 123456789012345678`")
     else:
-        await ctx.send(f"An error occurred: {error}")
+        excluded_user_ids.remove(member.id)
+        save_excluded_users(excluded_user_ids)
+        await ctx.send(f'{member.mention} has been re-included in time tracking.')
 
 @bot.command(name='listexcluded')
 async def list_excluded(ctx):
-    """Lists all users currently excluded from time tracking."""
     if not excluded_user_ids:
-        await ctx.send("No users are currently excluded from time tracking.")
-        return
+        await ctx.send("No users are currently excluded.")
+    else:
+        excluded_names = []
+        for uid in excluded_user_ids:
+            user = bot.get_user(uid)
+            excluded_names.append(f"{user.display_name if user else 'Unknown'} ({uid})")
+        await ctx.send("Excluded users:\n" + "\n".join(excluded_names))
 
-    excluded_names = []
-    for user_id in excluded_user_ids:
-        user = bot.get_user(user_id)
-        if user:
-            excluded_names.append(f"{user.display_name} ({user_id})")
-        else:
-            excluded_names.append(f"Unknown User ({user_id})")
+# Background task to clean up expired shift entries
+@tasks.loop(minutes=30)
+async def cleanup_old_shifts():
+    ph_tz = timezone('Asia/Manila')
+    now = datetime.now(ph_tz)
+    expired = []
+    for uid, entry in active_shifts.items():
+        shift_time = ph_tz.localize(datetime.strptime(entry['timestamp'], "%Y-%m-%d %H:%M:%S"))
+        if (now - shift_time) >= timedelta(hours=14):
+            expired.append(uid)
 
-    response_message = "Users currently excluded from time tracking:\n" + "\n".join(excluded_names)
-    await ctx.send(response_message)
+    for uid in expired:
+        del active_shifts[uid]
+    if expired:
+        save_active_shifts(active_shifts)
+        print(f"Cleaned up {len(expired)} expired shift entries.")
 
 if __name__ == '__main__':
     keep_alive()
