@@ -1,5 +1,5 @@
-Flask
 discord.py
+Flask
 gspread
 oauth2client
 pytz
