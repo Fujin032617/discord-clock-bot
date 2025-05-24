@@ -135,7 +135,6 @@ async def on_ready():
     print(f'Bot is online as {bot.user.name}')
     auto_clockout_expired_shifts.start()
 
-# ========= MODIFIED can_clock_in FUNCTION ==========
 def can_clock_in(user_id):
     """
     Check if user can clock in:
@@ -151,19 +150,14 @@ def can_clock_in(user_id):
 
     # 2. Check if user currently has an active shift
     if user_id in active_shifts:
-        # If they are already in active_shifts, they cannot clock in again.
-        # This covers cases where they were clocked in by voice or manually.
         return False
 
     # 3. Check the last clock-out time (cooldown)
-    # This prevents immediate re-clock-ins after a shift officially ended.
-    # Set a cooldown, e.g., 5 minutes. Adjust this to your preference.
-    cooldown_period = timedelta(minutes=5)
+    cooldown_period = timedelta(minutes=5) # You can adjust this duration
 
     last_out_str = last_clockouts.get(user_id)
     if last_out_str:
         last_out_time = ph_tz.localize(datetime.strptime(last_out_str, "%Y-%m-%d %H:%M:%S"))
-        # If the time since last clock-out is less than the cooldown period, prevent new clock-in
         if (now - last_out_time) < cooldown_period:
             return False
 
@@ -187,9 +181,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     # Auto Clock-in: User joins a voice channel (and wasn't in one before, or moved channels)
     if after.channel and (before.channel != after.channel):
-        # Only clock in if they aren't already actively clocked in AND pass can_clock_in checks
         if can_clock_in(user_id): # The can_clock_in now includes the cooldown check
-            # Perform clock-in
             active_shifts[user_id] = timestamp_str # Use int key
             save_active_shift_db(user_id, timestamp_str)
             
@@ -205,13 +197,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     await channel_to_send.send(f"{member.mention} has automatically clocked in (joined voice channel).")
                 except discord.Forbidden:
                     print(f"Cannot send message to {channel_to_send.name} in {member.guild.name}.")
-        # else:
-            # Optionally, you could send a message here if auto-clock-in was prevented by cooldown
-            # print(f"DEBUG: Auto clock-in prevented for {member.name} due to cooldown or active shift.")
     
-    # REMOVED: Auto Clock-out logic from voice channel departure.
-    # Users now MUST use !clockout or be auto-clocked out by the 14-hour task or !forceclockout.
-
 
 # ========== MANUAL CLOCK-IN/OUT COMMANDS ==========
 
@@ -222,7 +208,6 @@ async def clockin(ctx):
         await ctx.send(f"{ctx.author.mention}, you are excluded from time tracking.")
         return
 
-    # Check if they can clock in using the central can_clock_in logic
     if not can_clock_in(user_id):
         await ctx.send(f"{ctx.author.mention}, you cannot clock in at this time. You might already be clocked in, or have clocked out too recently. If you wish to end your current shift, use `!clockout`.")
         return
@@ -230,15 +215,13 @@ async def clockin(ctx):
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
     
-    # Log clock-in in Google Sheets
     try:
         sheet.append_row([ctx.author.name, "Clock In", timestamp_str])
     except Exception as e:
         await ctx.send(f"Failed to log your clock-in to Google Sheets. Please contact an admin. Error: {e}")
         print(f"Failed to append manual clock-in to Google Sheets for {ctx.author.name}: {e}")
-        return # Prevent incomplete state if sheet fails
+        return
 
-    # Save active shift in SQLite and memory
     active_shifts[user_id] = timestamp_str
     save_active_shift_db(user_id, timestamp_str)
 
@@ -251,12 +234,10 @@ async def clockout(ctx):
         await ctx.send(f"{ctx.author.mention}, you are excluded from time tracking.")
         return
 
-    if user_id not in active_shifts:
-        await ctx.send(f"{ctx.author.mention}, you are not currently clocked in.")
-        return
-
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    
+    was_active = user_id in active_shifts # Check if they were active BEFORE modification
 
     # Log clock-out in Google Sheets
     try:
@@ -264,16 +245,21 @@ async def clockout(ctx):
     except Exception as e:
         await ctx.send(f"Failed to log your clock-out to Google Sheets. Please contact an admin. Error: {e}")
         print(f"Failed to append manual clock-out to Google Sheets for {ctx.author.name}: {e}")
-        return # Prevent incomplete state if sheet fails
+        return
 
-    # Remove active shift and save last clockout time
-    del active_shifts[user_id]
-    remove_active_shift_db(user_id)
-
+    # Attempt to remove active shift regardless if found, to ensure state consistency
+    if was_active: # Only delete if it was present
+        del active_shifts[user_id]
+        remove_active_shift_db(user_id)
+    
     last_clockouts[user_id] = timestamp_str
     save_last_clockout_db(user_id, timestamp_str)
 
-    await ctx.send(f"{ctx.author.mention} clocked out at {timestamp_str}")
+    # Provide a more flexible response
+    if was_active:
+        await ctx.send(f"{ctx.author.mention} clocked out at {timestamp_str}.")
+    else:
+        await ctx.send(f"{ctx.author.mention} recorded a clock-out at {timestamp_str}. (Note: You were not registered as actively clocked in by the bot, but your clock-out has been logged and your status updated.)")
 
 
 @tasks.loop(minutes=15)
@@ -281,31 +267,25 @@ async def auto_clockout_expired_shifts():
     now = datetime.now(ph_tz)
     expired = []
 
-    # Iterate over a copy of active_shifts in case it's modified during iteration
-    for uid, clock_in_str in list(active_shifts.items()): # uid will be int here
+    for uid, clock_in_str in list(active_shifts.items()):
         clock_in_time = ph_tz.localize(datetime.strptime(clock_in_str, "%Y-%m-%d %H:%M:%S"))
         
-        # This is where the 14-hour rule is applied for auto-clock-out
-        if now - clock_in_time >= timedelta(hours=14): # Check if 14 hours have passed since clock-in
-            user = bot.get_user(uid) # uid is already an int
+        if now - clock_in_time >= timedelta(hours=14):
+            user = bot.get_user(uid)
             name = user.name if user else f"User ID: {uid}"
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
             
-            # Log clock-out automatically
             try:
                 sheet.append_row([name, "Clock Out (Auto)", timestamp_str])
             except Exception as e:
                 print(f"Failed to append auto clock-out to Google Sheets for {name}: {e}")
 
-            # Save last clockout time
             last_clockouts[uid] = timestamp_str
             save_last_clockout_db(uid, timestamp_str)
             
-            expired.append(uid) # Add uid (int) to expired list
+            expired.append(uid)
             
-            # Notify the user or a designated channel about auto clock-out
             if user:
-                # Attempt to find a suitable channel to send the notification
                 for guild in bot.guilds:
                     member = guild.get_member(uid)
                     if member:
@@ -316,12 +296,11 @@ async def auto_clockout_expired_shifts():
                             try:
                                 await target_channel.send(f"{user.mention} was automatically clocked out after 14 hours.")
                             except discord.Forbidden:
-                                print(f"Cannot send message to {target_channel.name} in {guild.guild.name}.")
+                                print(f"Cannot send message to {target_channel.name} in {guild.name}.")
                             break
             else:
                 print(f"Could not find Discord user for ID {uid} for auto clock-out notification.")
 
-    # Remove expired shifts from memory and DB
     for uid in expired:
         del active_shifts[uid]
         remove_active_shift_db(uid)
@@ -351,9 +330,8 @@ async def exclude(ctx, member: discord.Member = None, *, username: str = None):
         return
     
     save_excluded_user_db(target_user_id)
-    excluded_user_ids.add(target_user_id) # Add to the in-memory set
+    excluded_user_ids.add(target_user_id)
     
-    # Also remove active shift if any
     if target_user_id in active_shifts:
         del active_shifts[target_user_id]
         remove_active_shift_db(target_user_id)
@@ -385,7 +363,7 @@ async def include(ctx, member: discord.Member = None, *, username: str = None):
         return
     
     remove_excluded_user_db(target_user_id)
-    excluded_user_ids.remove(target_user_id) # Remove from the in-memory set
+    excluded_user_ids.remove(target_user_id)
     
     await ctx.send(f"{target_user_name} has been included back in time tracking.")
 
@@ -402,7 +380,7 @@ async def listexcluded(ctx):
         if user:
             excluded_names.append(user.name)
         else:
-            excluded_names.append(f"Unknown User (ID: {uid})") # More informative
+            excluded_names.append(f"Unknown User (ID: {uid})")
     await ctx.send("Excluded users:\n" + "\n".join(excluded_names))
 
 @bot.command()
@@ -425,14 +403,16 @@ async def onduty(ctx):
 async def forceclockout(ctx, member: discord.Member):
     """Force a user to clock out."""
     user_id = member.id
-    if user_id not in active_shifts:
-        await ctx.send(f"{member.name} is not currently clocked in.")
-        return
+    # We remove the check here for flexibility, similar to !clockout
+    # if user_id not in active_shifts:
+    #     await ctx.send(f"{member.name} is not currently clocked in.")
+    #     return
 
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Log clock-out in Google Sheets
+    was_active = user_id in active_shifts # Check if they were active BEFORE modification
+
     try:
         sheet.append_row([member.name, "Clock Out (Force)", timestamp_str])
     except Exception as e:
@@ -440,14 +420,18 @@ async def forceclockout(ctx, member: discord.Member):
         print(f"Failed to append force clock-out to Google Sheets for {member.name}: {e}")
         return
 
-    # Remove active shift and save last clockout time
-    del active_shifts[user_id]
-    remove_active_shift_db(user_id)
+    # Attempt to remove active shift regardless if found, to ensure state consistency
+    if was_active: # Only delete if it was present
+        del active_shifts[user_id]
+        remove_active_shift_db(user_id)
     
     last_clockouts[user_id] = timestamp_str
     save_last_clockout_db(user_id, timestamp_str)
 
-    await ctx.send(f"{member.mention} has been force clocked out at {timestamp_str}.")
+    if was_active:
+        await ctx.send(f"{member.mention} has been force clocked out at {timestamp_str}.")
+    else:
+        await ctx.send(f"{member.mention} has had a force clock-out logged at {timestamp_str}. (Note: They were not registered as actively clocked in by the bot, but their clock-out has been logged and status updated.)")
 
 
 if __name__ == '__main__':
