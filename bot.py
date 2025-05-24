@@ -1,5 +1,5 @@
 import os
-import json
+import sqlite3
 from flask import Flask, make_response
 from threading import Thread
 import discord
@@ -9,11 +9,86 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
 from pytz import timezone
 
-EXCLUDED_USERS_FILE = 'excluded_users.json'
-ACTIVE_SHIFTS_FILE = 'active_shifts.json'
-LAST_CLOCKOUT_FILE = 'last_clockout.json'
+# === SQLite DB Setup ===
+DB_PATH = '/data/bot_data.db'
+os.makedirs('/data', exist_ok=True)
 
-# Flask App Setup
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS excluded_users (user_id INTEGER PRIMARY KEY)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS active_shifts (
+                        user_id INTEGER PRIMARY KEY,
+                        date TEXT,
+                        timestamp TEXT
+                    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS last_clockouts (
+                        user_id INTEGER PRIMARY KEY,
+                        timestamp TEXT
+                    )''')
+    conn.commit()
+    conn.close()
+
+def add_excluded_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO excluded_users (user_id) VALUES (?)', (user_id,))
+    conn.commit()
+    conn.close()
+
+def remove_excluded_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM excluded_users WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_excluded_users():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM excluded_users')
+    result = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return result
+
+def save_active_shift(user_id, date, timestamp):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('REPLACE INTO active_shifts (user_id, date, timestamp) VALUES (?, ?, ?)', (user_id, date, timestamp))
+    conn.commit()
+    conn.close()
+
+def remove_active_shift(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM active_shifts WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_active_shifts():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, date, timestamp FROM active_shifts')
+    result = {str(row[0]): {'date': row[1], 'timestamp': row[2]} for row in cursor.fetchall()}
+    conn.close()
+    return result
+
+def get_last_clockouts():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, timestamp FROM last_clockouts')
+    result = {str(row[0]): row[1] for row in cursor.fetchall()}
+    conn.close()
+    return result
+
+def save_last_clockout(user_id, timestamp):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('REPLACE INTO last_clockouts (user_id, timestamp) VALUES (?, ?)', (user_id, timestamp))
+    conn.commit()
+    conn.close()
+
+# === Flask Setup ===
 app = Flask('')
 
 def run():
@@ -31,46 +106,13 @@ def home():
     response.headers['X-XSS-Protection'] = '1; mode=block'
     return response
 
-# Load/save functions
-def load_json_file(filepath, default):
-    if os.path.exists(filepath):
-        with open(filepath, 'r') as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return default
-    return default
-
-def save_json_file(filepath, data):
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=4)
-
-def load_excluded_users():
-    return load_json_file(EXCLUDED_USERS_FILE, [])
-
-def save_excluded_users(user_ids):
-    save_json_file(EXCLUDED_USERS_FILE, user_ids)
-
-def load_active_shifts():
-    return load_json_file(ACTIVE_SHIFTS_FILE, {})
-
-def save_active_shifts(data):
-    save_json_file(ACTIVE_SHIFTS_FILE, data)
-
-def load_last_clockouts():
-    return load_json_file(LAST_CLOCKOUT_FILE, {})
-
-def save_last_clockouts(data):
-    save_json_file(LAST_CLOCKOUT_FILE, data)
-
-# Discord Setup
+# === Discord Setup ===
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Google Sheets Setup
+# === Google Sheets Setup ===
 scope = [
     "https://spreadsheets.google.com/feeds",
     'https://www.googleapis.com/auth/spreadsheets',
@@ -81,10 +123,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
 client = gspread.authorize(creds)
 sheet = client.open("Employee Time Log").sheet1
 
-# Load Data
-excluded_user_ids = load_excluded_users()
-active_shifts = load_active_shifts()
-last_clockouts = load_last_clockouts()
+init_db()
 
 @bot.event
 async def on_ready():
@@ -94,30 +133,27 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if member.bot or member.id in excluded_user_ids:
+    if member.bot or member.id in get_excluded_users():
         return
     if before.channel is not None or after.channel is None:
-        return  # Only trigger on join
+        return
 
     ph_tz = timezone('Asia/Manila')
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
     user_id_str = str(member.id)
 
-    # Check last clockout
+    last_clockouts = get_last_clockouts()
     if user_id_str in last_clockouts:
-        last_out_time = datetime.strptime(last_clockouts[user_id_str], "%Y-%m-%d %H:%M:%S")
-        last_out_time = ph_tz.localize(last_out_time)
+        last_out_time = ph_tz.localize(datetime.strptime(last_clockouts[user_id_str], "%Y-%m-%d %H:%M:%S"))
         if (now - last_out_time) < timedelta(minutes=15):
             print(f"{member.name} tried to Clock In too soon after Clock Out.")
             return
 
-    # Check last clock in
-    previous_entry = active_shifts.get(user_id_str)
+    active_shifts = get_active_shifts()
     allow_clock_in = False
-    if previous_entry:
-        last_clock_in_time = datetime.strptime(previous_entry['timestamp'], "%Y-%m-%d %H:%M:%S")
-        last_clock_in_time = ph_tz.localize(last_clock_in_time)
+    if user_id_str in active_shifts:
+        last_clock_in_time = ph_tz.localize(datetime.strptime(active_shifts[user_id_str]['timestamp'], "%Y-%m-%d %H:%M:%S"))
         if (now - last_clock_in_time) >= timedelta(hours=14):
             allow_clock_in = True
     else:
@@ -125,16 +161,12 @@ async def on_voice_state_update(member, before, after):
 
     if allow_clock_in:
         sheet.append_row([member.name, 'Clock In', timestamp_str])
-        active_shifts[user_id_str] = {
-            'date': now.strftime("%Y-%m-%d"),
-            'timestamp': timestamp_str
-        }
-        save_active_shifts(active_shifts)
+        save_active_shift(member.id, now.strftime("%Y-%m-%d"), timestamp_str)
         print(f'{member.name} Clock In at {timestamp_str}')
 
 @bot.command()
 async def clockout(ctx):
-    if ctx.author.id in excluded_user_ids:
+    if ctx.author.id in get_excluded_users():
         await ctx.send(f'{ctx.author.mention}, you are not eligible for time tracking.')
         return
 
@@ -145,51 +177,38 @@ async def clockout(ctx):
     await ctx.send(f'{ctx.author.mention} has clocked out at {timestamp}')
     print(f'{ctx.author.name} Clock Out at {timestamp}')
 
-    user_id_str = str(ctx.author.id)
-    if user_id_str in active_shifts:
-        del active_shifts[user_id_str]
-        save_active_shifts(active_shifts)
-    last_clockouts[user_id_str] = timestamp
-    save_last_clockouts(last_clockouts)
+    remove_active_shift(ctx.author.id)
+    save_last_clockout(ctx.author.id, timestamp)
 
 @bot.command(name='exclude')
 @commands.has_permissions(administrator=True)
 async def exclude_user(ctx, member: discord.Member):
-    global excluded_user_ids
-    if member.id in excluded_user_ids:
-        await ctx.send(f'{member.mention} is already in the exclusion list.')
-    else:
-        excluded_user_ids.append(member.id)
-        save_excluded_users(excluded_user_ids)
-        await ctx.send(f'{member.mention} has been excluded from time tracking.')
+    add_excluded_user(member.id)
+    await ctx.send(f'{member.mention} has been excluded from time tracking.')
 
 @bot.command(name='unexclude')
 @commands.has_permissions(administrator=True)
 async def unexclude_user(ctx, member: discord.Member):
-    global excluded_user_ids
-    if member.id not in excluded_user_ids:
-        await ctx.send(f'{member.mention} is not in the exclusion list.')
-    else:
-        excluded_user_ids.remove(member.id)
-        save_excluded_users(excluded_user_ids)
-        await ctx.send(f'{member.mention} has been re-included in time tracking.')
+    remove_excluded_user(member.id)
+    await ctx.send(f'{member.mention} has been re-included in time tracking.')
 
 @bot.command(name='listexcluded')
 async def list_excluded(ctx):
-    if not excluded_user_ids:
+    excluded_ids = get_excluded_users()
+    if not excluded_ids:
         await ctx.send("No users are currently excluded.")
     else:
         excluded_names = []
-        for uid in excluded_user_ids:
+        for uid in excluded_ids:
             user = bot.get_user(uid)
             excluded_names.append(f"{user.display_name if user else 'Unknown'} ({uid})")
         await ctx.send("Excluded users:\n" + "\n".join(excluded_names))
 
-# Background task to clean up expired shift entries
 @tasks.loop(minutes=30)
 async def cleanup_old_shifts():
     ph_tz = timezone('Asia/Manila')
     now = datetime.now(ph_tz)
+    active_shifts = get_active_shifts()
     expired = []
     for uid, entry in active_shifts.items():
         shift_time = ph_tz.localize(datetime.strptime(entry['timestamp'], "%Y-%m-%d %H:%M:%S"))
@@ -197,19 +216,17 @@ async def cleanup_old_shifts():
             expired.append(uid)
 
     for uid in expired:
-        del active_shifts[uid]
+        remove_active_shift(int(uid))
     if expired:
-        save_active_shifts(active_shifts)
         print(f"Cleaned up {len(expired)} expired shift entries.")
 
-# Reminder to clock out every 8 hours in general channels
 @tasks.loop(hours=8)
 async def public_clockout_reminder():
     for guild in bot.guilds:
         general_channel = discord.utils.get(guild.text_channels, name='general')
         if general_channel:
             try:
-                await general_channel.send("\u23f0 Friendly reminder: Don't forget to clock out after your shift. Anyone who doesn't clock out will be marked as absent! -HRJEL ")
+                await general_channel.send("⏰ Friendly reminder: Don't forget to clock out after your shift. Anyone who doesn't clock out will be marked as absent! -HRJEL ")
             except Exception as e:
                 print(f"Failed to send reminder in {guild.name}: {e}")
         else:
