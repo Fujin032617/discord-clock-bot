@@ -152,7 +152,7 @@ def can_clock_in(user_id):
             return False  # Still inside shift period, no clock-in allowed
     return True
 
-# ========== RE-INTRODUCED AUTOMATIC CLOCK-IN/OUT ==========
+# ========== MODIFIED AUTOMATIC CLOCK-IN ONLY ==========
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     user_id = member.id
@@ -174,7 +174,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             # Check if they can clock in based on the 14-hour rule (prevents immediate re-clock-in after manual clock-out)
             if not can_clock_in(user_id):
                 # Optionally send a message if they can't auto-clock in
-                # guild.system_channel or first text channel
                 channel_to_send = member.guild.system_channel or \
                                   (member.guild.text_channels[0] if member.guild.text_channels else None)
                 if channel_to_send:
@@ -189,7 +188,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             save_active_shift_db(user_id, timestamp_str)
             
             try:
-                sheet.append_row([member.name, "Clock In (Auto)", timestamp_str])
+                sheet.append_row([member.name, "Clock In", timestamp_str])
             except Exception as e:
                 print(f"Failed to append auto clock-in to Google Sheets for {member.name}: {e}")
 
@@ -200,29 +199,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     await channel_to_send.send(f"{member.mention} has automatically clocked in (joined voice channel).")
                 except discord.Forbidden:
                     print(f"Cannot send message to {channel_to_send.name} in {member.guild.name}.")
-
-    # Auto Clock-out: User leaves all voice channels
-    if before.channel and (after.channel is None):
-        if user_id in active_shifts: # Check if they were actively clocked in
-            # Perform clock-out
-            del active_shifts[user_id] # Use int key
-            remove_active_shift_db(user_id)
-            
-            last_clockouts[user_id] = timestamp_str
-            save_last_clockout_db(user_id, timestamp_str)
-            
-            try:
-                sheet.append_row([member.name, "Clock Out (Auto)", timestamp_str])
-            except Exception as e:
-                print(f"Failed to append auto clock-out to Google Sheets for {member.name}: {e}")
-
-            channel_to_send = member.guild.system_channel or \
-                              (member.guild.text_channels[0] if member.guild.text_channels else None)
-            if channel_to_send:
-                try:
-                    await channel_to_send.send(f"{member.mention} has automatically clocked out (left voice channel).")
-                except discord.Forbidden:
-                    print(f"Cannot send message to {channel_to_send.name} in {member.guild.name}.")
+    
+    # REMOVED: Auto Clock-out logic from voice channel departure.
+    # Users now MUST use !clockout or be auto-clocked out by the 14-hour task or !forceclockout.
 
 
 # ========== MANUAL CLOCK-IN/OUT COMMANDS ==========
@@ -244,7 +223,7 @@ async def clockin(ctx):
     
     # Log clock-in in Google Sheets
     try:
-        sheet.append_row([ctx.author.name, "Clock In (Manual)", timestamp_str])
+        sheet.append_row([ctx.author.name, "Clock In", timestamp_str])
     except Exception as e:
         await ctx.send(f"Failed to log your clock-in to Google Sheets. Please contact an admin. Error: {e}")
         print(f"Failed to append manual clock-in to Google Sheets for {ctx.author.name}: {e}")
@@ -272,7 +251,7 @@ async def clockout(ctx):
 
     # Log clock-out in Google Sheets
     try:
-        sheet.append_row([ctx.author.name, "Clock Out (Manual)", timestamp_str])
+        sheet.append_row([ctx.author.name, "Clock Out", timestamp_str])
     except Exception as e:
         await ctx.send(f"Failed to log your clock-out to Google Sheets. Please contact an admin. Error: {e}")
         print(f"Failed to append manual clock-out to Google Sheets for {ctx.author.name}: {e}")
@@ -303,7 +282,7 @@ async def auto_clockout_expired_shifts():
             
             # Log clock-out automatically
             try:
-                sheet.append_row([name, "Clock Out (Auto)", timestamp_str])
+                sheet.append_row([name, "Clock Out (Auto)", timestamp_str]) # KEPT as "Clock Out (Auto)"
             except Exception as e:
                 print(f"Failed to append auto clock-out to Google Sheets for {name}: {e}")
 
