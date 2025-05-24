@@ -135,21 +135,39 @@ async def on_ready():
     print(f'Bot is online as {bot.user.name}')
     auto_clockout_expired_shifts.start()
 
+# ========= MODIFIED can_clock_in FUNCTION ==========
 def can_clock_in(user_id):
-    """Check if user can clock in: no active shift or last clock-in older than 14 hours."""
+    """
+    Check if user can clock in:
+    1. Not excluded.
+    2. No active shift.
+    3. Last clock-out (if any) was beyond a defined cooldown period.
+    """
     now = datetime.now(ph_tz)
 
-    # If user is excluded, never allow clock-in
+    # 1. If user is excluded, never allow clock-in
     if user_id in excluded_user_ids:
         return False
 
-    # Check if user has active shift
-    clock_in_str = active_shifts.get(user_id) # Use int key
-    if clock_in_str:
-        clock_in_time = ph_tz.localize(datetime.strptime(clock_in_str, "%Y-%m-%d %H:%M:%S"))
-        diff = now - clock_in_time
-        if diff < timedelta(hours=14):
-            return False  # Still inside shift period, no clock-in allowed
+    # 2. Check if user currently has an active shift
+    if user_id in active_shifts:
+        # If they are already in active_shifts, they cannot clock in again.
+        # This covers cases where they were clocked in by voice or manually.
+        return False
+
+    # 3. Check the last clock-out time (cooldown)
+    # This prevents immediate re-clock-ins after a shift officially ended.
+    # Set a cooldown, e.g., 5 minutes. Adjust this to your preference.
+    cooldown_period = timedelta(minutes=5)
+
+    last_out_str = last_clockouts.get(user_id)
+    if last_out_str:
+        last_out_time = ph_tz.localize(datetime.strptime(last_out_str, "%Y-%m-%d %H:%M:%S"))
+        # If the time since last clock-out is less than the cooldown period, prevent new clock-in
+        if (now - last_out_time) < cooldown_period:
+            return False
+
+    # If all checks pass, the user can clock in
     return True
 
 # ========== MODIFIED AUTOMATIC CLOCK-IN ONLY ==========
@@ -169,20 +187,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     # Auto Clock-in: User joins a voice channel (and wasn't in one before, or moved channels)
     if after.channel and (before.channel != after.channel):
-        # Only clock in if they aren't already actively clocked in
-        if user_id not in active_shifts:
-            # Check if they can clock in based on the 14-hour rule (prevents immediate re-clock-in after manual clock-out)
-            if not can_clock_in(user_id):
-                # Optionally send a message if they can't auto-clock in
-                channel_to_send = member.guild.system_channel or \
-                                  (member.guild.text_channels[0] if member.guild.text_channels else None)
-                if channel_to_send:
-                    try:
-                        await channel_to_send.send(f"{member.mention}, you attempted to auto-clock in but you are already clocked in or recently clocked out. Please use `!clockout` if you intended to end your previous shift.")
-                    except discord.Forbidden:
-                        print(f"Cannot send message to {channel_to_send.name} in {member.guild.name}.")
-                return
-
+        # Only clock in if they aren't already actively clocked in AND pass can_clock_in checks
+        if can_clock_in(user_id): # The can_clock_in now includes the cooldown check
             # Perform clock-in
             active_shifts[user_id] = timestamp_str # Use int key
             save_active_shift_db(user_id, timestamp_str)
@@ -199,6 +205,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     await channel_to_send.send(f"{member.mention} has automatically clocked in (joined voice channel).")
                 except discord.Forbidden:
                     print(f"Cannot send message to {channel_to_send.name} in {member.guild.name}.")
+        # else:
+            # Optionally, you could send a message here if auto-clock-in was prevented by cooldown
+            # print(f"DEBUG: Auto clock-in prevented for {member.name} due to cooldown or active shift.")
     
     # REMOVED: Auto Clock-out logic from voice channel departure.
     # Users now MUST use !clockout or be auto-clocked out by the 14-hour task or !forceclockout.
@@ -215,7 +224,7 @@ async def clockin(ctx):
 
     # Check if they can clock in using the central can_clock_in logic
     if not can_clock_in(user_id):
-        await ctx.send(f"{ctx.author.mention}, you already clocked in or recently clocked out within the last 14 hours. If you wish to end your current shift, use `!clockout`.")
+        await ctx.send(f"{ctx.author.mention}, you cannot clock in at this time. You might already be clocked in, or have clocked out too recently. If you wish to end your current shift, use `!clockout`.")
         return
 
     now = datetime.now(ph_tz)
@@ -275,14 +284,16 @@ async def auto_clockout_expired_shifts():
     # Iterate over a copy of active_shifts in case it's modified during iteration
     for uid, clock_in_str in list(active_shifts.items()): # uid will be int here
         clock_in_time = ph_tz.localize(datetime.strptime(clock_in_str, "%Y-%m-%d %H:%M:%S"))
-        if now - clock_in_time >= timedelta(hours=14):
+        
+        # This is where the 14-hour rule is applied for auto-clock-out
+        if now - clock_in_time >= timedelta(hours=14): # Check if 14 hours have passed since clock-in
             user = bot.get_user(uid) # uid is already an int
             name = user.name if user else f"User ID: {uid}"
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
             
             # Log clock-out automatically
             try:
-                sheet.append_row([name, "Clock Out (Auto)", timestamp_str]) # KEPT as "Clock Out (Auto)"
+                sheet.append_row([name, "Clock Out (Auto)", timestamp_str])
             except Exception as e:
                 print(f"Failed to append auto clock-out to Google Sheets for {name}: {e}")
 
@@ -295,11 +306,9 @@ async def auto_clockout_expired_shifts():
             # Notify the user or a designated channel about auto clock-out
             if user:
                 # Attempt to find a suitable channel to send the notification
-                # You might want to define a specific channel ID in config for this
                 for guild in bot.guilds:
                     member = guild.get_member(uid)
                     if member:
-                        # Try system channel, then general text channel, then first text channel
                         target_channel = guild.system_channel or \
                                          discord.utils.get(guild.text_channels, name='general') or \
                                          (guild.text_channels[0] if guild.text_channels else None)
@@ -307,7 +316,7 @@ async def auto_clockout_expired_shifts():
                             try:
                                 await target_channel.send(f"{user.mention} was automatically clocked out after 14 hours.")
                             except discord.Forbidden:
-                                print(f"Cannot send message to {target_channel.name} in {guild.name}.")
+                                print(f"Cannot send message to {target_channel.name} in {guild.guild.name}.")
                             break
             else:
                 print(f"Could not find Discord user for ID {uid} for auto clock-out notification.")
