@@ -112,27 +112,6 @@ def save_last_clockout(user_id, timestamp):
     conn.commit()
     conn.close()
 
-# ========== Helper function to check clock-in from DB ==========
-
-ph_tz = timezone('Asia/Manila')
-
-def user_has_recent_clockin(user_id):
-    """Return True if user has clocked in less than 14 hours ago (prevents new clock-in)."""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT timestamp FROM active_shifts WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        try:
-            clock_in_time = ph_tz.localize(datetime.strptime(row['timestamp'], "%Y-%m-%d %H:%M:%S"))
-            now = datetime.now(ph_tz)
-            if now - clock_in_time < timedelta(hours=14):
-                return True
-        except Exception as e:
-            print(f"Error parsing clock-in time: {e}")
-    return False
-
 # ========== Discord Setup ==========
 
 intents = discord.Intents.default()
@@ -141,7 +120,11 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Google Sheets Setup
-scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 creds_json = json.loads(os.environ['GOOGLE_CREDS'])
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
 client = gspread.authorize(creds)
@@ -151,124 +134,113 @@ excluded_user_ids = load_excluded_users()
 active_shifts = load_active_shifts()
 last_clockouts = load_last_clockouts()
 
-print("Excluded users loaded:", excluded_user_ids)
-print("Active shifts loaded:", active_shifts)
-print("Last clockouts loaded:", last_clockouts)
-
 @bot.event
 async def on_ready():
     print(f'Bot is online as {bot.user.name}')
     auto_clockout_expired_shifts.start()
 
-@bot.command()
-async def clockin(ctx):
-    user_id = ctx.author.id
-    user_id_str = str(user_id)
-
-    if user_id in excluded_user_ids:
-        await ctx.send(f'{ctx.author.mention}, you are not eligible for time tracking.')
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Only clock in on voice channel join
+    if member.bot or member.id in excluded_user_ids:
+        return
+    if before.channel is not None or after.channel is None:
         return
 
-    # Check DB if user has recent clock-in
-    if user_has_recent_clockin(user_id):
-        await ctx.send(f"{ctx.author.mention}, you already clocked in less than 14 hours ago. Please clock out before clocking in again.")
-        return
-
+    ph_tz = timezone('Asia/Manila')
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    sheet.append_row([ctx.author.name, 'Clock In', timestamp_str])
+    user_id_str = str(member.id)
 
-    # Update in-memory and DB active shifts
+    # Check last clock-out; cooldown 15 minutes prevents rapid clock-in/out cycles
+    if user_id_str in last_clockouts:
+        last_out_time = ph_tz.localize(datetime.strptime(last_clockouts[user_id_str], "%Y-%m-%d %H:%M:%S"))
+        if (now - last_out_time) < timedelta(minutes=15):
+            return
+
+    previous_entry = active_shifts.get(user_id_str)
+
+    # Prevent multiple clock-ins within 14 hours (your required logic)
+    if previous_entry:
+        last_clock_in_time = ph_tz.localize(datetime.strptime(previous_entry['timestamp'], "%Y-%m-%d %H:%M:%S"))
+        if (now - last_clock_in_time) < timedelta(hours=14):
+            return  # Don't clock in again yet
+
+    # Clock in
+    sheet.append_row([member.name, 'Clock In', timestamp_str])
     active_shifts[user_id_str] = {'date': now.strftime("%Y-%m-%d"), 'timestamp': timestamp_str}
-    save_active_shift(user_id, now.strftime("%Y-%m-%d"), timestamp_str)
-
-    await ctx.send(f'{ctx.author.mention} has clocked in at {timestamp_str}')
+    save_active_shift(member.id, now.strftime("%Y-%m-%d"), timestamp_str)
 
 @bot.command()
 async def clockout(ctx):
-    user_id = ctx.author.id
-    user_id_str = str(user_id)
-
-    if user_id in excluded_user_ids:
+    if ctx.author.id in excluded_user_ids:
         await ctx.send(f'{ctx.author.mention}, you are not eligible for time tracking.')
         return
 
+    ph_tz = timezone('Asia/Manila')
     now = datetime.now(ph_tz)
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    sheet.append_row([ctx.author.name, 'Clock Out', timestamp_str])
-    await ctx.send(f'{ctx.author.mention} has clocked out at {timestamp_str}')
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    sheet.append_row([ctx.author.name, 'Clock Out', timestamp])
+    await ctx.send(f'{ctx.author.mention} has clocked out at {timestamp}')
 
-    # Remove active shift from memory and DB
+    user_id_str = str(ctx.author.id)
     if user_id_str in active_shifts:
         del active_shifts[user_id_str]
-        remove_active_shift(user_id)
-
-    # Save last clockout timestamp
-    last_clockouts[user_id_str] = timestamp_str
-    save_last_clockout(user_id, timestamp_str)
+        remove_active_shift(ctx.author.id)
+    last_clockouts[user_id_str] = timestamp
+    save_last_clockout(ctx.author.id, timestamp)
 
 @bot.command()
 async def exclude(ctx, user: discord.User):
-    user_id = user.id
-    if user_id in excluded_user_ids:
-        await ctx.send(f"{user.name} is already excluded from time tracking.")
-        return
-    excluded_user_ids.append(user_id)
-    save_excluded_user(user_id)
-    # Also remove active shift if any
-    if str(user_id) in active_shifts:
-        del active_shifts[str(user_id)]
-        remove_active_shift(user_id)
-    await ctx.send(f"{user.name} has been excluded from time tracking.")
+    # Add user to exclude list
+    save_excluded_user(user.id)
+    excluded_user_ids.append(user.id)
+    await ctx.send(f'{user.name} has been excluded from time tracking.')
 
 @bot.command()
 async def unexclude(ctx, user: discord.User):
-    user_id = user.id
-    if user_id not in excluded_user_ids:
-        await ctx.send(f"{user.name} is not excluded from time tracking.")
-        return
-    excluded_user_ids.remove(user_id)
-    remove_excluded_user(user_id)
-    await ctx.send(f"{user.name} is no longer excluded from time tracking.")
+    # Remove user from exclude list
+    remove_excluded_user(user.id)
+    excluded_user_ids.remove(user.id)
+    await ctx.send(f'{user.name} is no longer excluded from time tracking.')
 
 @bot.command()
 async def listexcluded(ctx):
     if not excluded_user_ids:
-        await ctx.send("No users are currently excluded.")
+        await ctx.send('No users are excluded.')
         return
-    mentions = []
-    for user_id in excluded_user_ids:
-        user = bot.get_user(user_id)
-        if user:
-            mentions.append(user.mention)
-        else:
-            mentions.append(f"<@{user_id}>")
-    await ctx.send("Excluded users:\n" + "\n".join(mentions))
+    msg = "Excluded users:\n"
+    for uid in excluded_user_ids:
+        user = bot.get_user(uid)
+        msg += f"- {user.name if user else uid}\n"
+    await ctx.send(msg)
 
 @tasks.loop(minutes=15)
 async def auto_clockout_expired_shifts():
+    ph_tz = timezone('Asia/Manila')
     now = datetime.now(ph_tz)
     expired = []
 
     for uid, entry in active_shifts.items():
-        try:
-            shift_time = ph_tz.localize(datetime.strptime(entry['timestamp'], "%Y-%m-%d %H:%M:%S"))
-        except Exception as e:
-            print(f"Error parsing shift_time for user {uid}: {e}")
-            continue
-
+        shift_time = ph_tz.localize(datetime.strptime(entry['timestamp'], "%Y-%m-%d %H:%M:%S"))
         if (now - shift_time) >= timedelta(hours=14):
-            user_obj = bot.get_user(int(uid))
-            user_name = user_obj.name if user_obj else str(uid)
+            # Prevent duplicate clock-out:
+            last_out_str = last_clockouts.get(uid)
+            if last_out_str:
+                last_out_time = ph_tz.localize(datetime.strptime(last_out_str, "%Y-%m-%d %H:%M:%S"))
+                if last_out_time > shift_time:
+                    continue  # Already clocked out
+
+            user = bot.get_user(int(uid))
+            username = user.name if user else uid
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-            sheet.append_row([user_name, 'Clock Out', timestamp_str])
+            sheet.append_row([username, 'Clock Out', timestamp_str])
             save_last_clockout(int(uid), timestamp_str)
+            last_clockouts[uid] = timestamp_str
             expired.append(uid)
-            await user_obj.send(f"You have been automatically clocked out after 14 hours.") if user_obj else None
 
     for uid in expired:
-        if uid in active_shifts:
-            del active_shifts[uid]
+        del active_shifts[uid]
         remove_active_shift(int(uid))
 
 if __name__ == '__main__':
