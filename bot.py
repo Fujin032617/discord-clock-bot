@@ -43,8 +43,23 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS excluded_users (user_id INTEGER PRIMARY KEY)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS active_shifts (user_id INTEGER PRIMARY KEY, clock_in TEXT)''')
+    # Always try to create with the latest schema. If it exists, IF NOT EXISTS will prevent re-creation.
+    # The migration logic below handles adding missing columns to existing tables.
+    c.execute('''CREATE TABLE IF NOT EXISTS active_shifts (user_id INTEGER PRIMARY KEY, clock_in TEXT, guild_id INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS last_clockouts (user_id INTEGER PRIMARY KEY, timestamp TEXT)''')
+
+    # --- DATABASE MIGRATION LOGIC ---
+    # Check if 'guild_id' column exists in 'active_shifts' table.
+    # If not, add it using ALTER TABLE. This preserves existing data.
+    try:
+        c.execute("SELECT guild_id FROM active_shifts LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Migrating active_shifts table: Adding 'guild_id' column...")
+        c.execute("ALTER TABLE active_shifts ADD COLUMN guild_id INTEGER")
+        conn.commit()
+        print("Migration complete. Existing active shifts will have NULL for guild_id until re-clocked.")
+    # --- END MIGRATION LOGIC ---
+
     conn.commit()
     conn.close()
 
@@ -72,18 +87,21 @@ def remove_excluded_user_db(user_id):
     conn.commit()
     conn.close()
 
+# MODIFIED: load_active_shifts_db to load guild_id
 def load_active_shifts_db():
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT user_id, clock_in FROM active_shifts')
+    c.execute('SELECT user_id, clock_in, guild_id FROM active_shifts')
     rows = c.fetchall()
     conn.close()
-    return {row['user_id']: row['clock_in'] for row in rows} # Keys are integers
+    # Store as {user_id: {'clock_in': clock_in_time, 'guild_id': guild_id}}
+    return {row['user_id']: {'clock_in': row['clock_in'], 'guild_id': row['guild_id']} for row in rows}
 
-def save_active_shift_db(user_id, clock_in):
+# MODIFIED: save_active_shift_db to accept guild_id
+def save_active_shift_db(user_id, clock_in, guild_id):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO active_shifts (user_id, clock_in) VALUES (?, ?)', (user_id, clock_in))
+    c.execute('INSERT OR REPLACE INTO active_shifts (user_id, clock_in, guild_id) VALUES (?, ?, ?)', (user_id, clock_in, guild_id))
     conn.commit()
     conn.close()
 
@@ -125,7 +143,8 @@ sheet = client.open("Employee Time Log").sheet1
 
 # Load data into memory using corrected functions
 excluded_user_ids = load_excluded_users_db() # This is now a set
-active_shifts = load_active_shifts_db() # Keys are integers
+# MODIFIED: active_shifts now stores dicts
+active_shifts = load_active_shifts_db() # Keys are integers, values are {'clock_in': str, 'guild_id': int}
 last_clockouts = load_last_clockouts_db() # Keys are integers
 
 ph_tz = timezone('Asia/Manila')
@@ -168,6 +187,7 @@ def can_clock_in(user_id):
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     user_id = member.id
+    guild_id = member.guild.id # Get the guild ID where the event occurred
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -182,9 +202,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # Auto Clock-in: User joins a voice channel (and wasn't in one before, or moved channels)
     if after.channel and (before.channel != after.channel):
         if can_clock_in(user_id): # The can_clock_in now includes the cooldown check
-            active_shifts[user_id] = timestamp_str # Use int key
-            save_active_shift_db(user_id, timestamp_str)
-            
+            # MODIFIED: Store guild_id in active_shifts
+            active_shifts[user_id] = {'clock_in': timestamp_str, 'guild_id': guild_id}
+            save_active_shift_db(user_id, timestamp_str, guild_id)
+
             try:
                 sheet.append_row([member.name, "Clock In", timestamp_str])
             except Exception as e:
@@ -197,35 +218,60 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     await channel_to_send.send(f"{member.mention} has automatically clocked in (joined voice channel).")
                 except discord.Forbidden:
                     print(f"Cannot send message to {channel_to_send.name} in {member.guild.name}.")
-    
+
 
 # ========== MANUAL CLOCK-IN/OUT COMMANDS ==========
 
 @bot.command()
-async def clockin(ctx):
-    user_id = ctx.author.id
+@commands.has_permissions(administrator=True) # THIS LINE RESTRICTS THE COMMAND TO ADMINS
+async def clockin(ctx, member: discord.Member = None, *, username: str = None):
+    target_user = None
+    if member:
+        target_user = member
+    elif username:
+        # Search for member by username
+        found_members = [m for m in ctx.guild.members if m.name.lower() == username.lower()]
+        if not found_members:
+            await ctx.send(f'No user found with username "{username}". Please mention the user or provide exact username.')
+            return
+        target_user = found_members[0]
+    else:
+        # If no member or username provided, the admin is clocking themselves in.
+        target_user = ctx.author
+
+    user_id = target_user.id
+    guild_id = ctx.guild.id
+    target_name = target_user.name
+
     if user_id in excluded_user_ids:
-        await ctx.send(f"{ctx.author.mention}, you are excluded from time tracking.")
+        await ctx.send(f"{target_user.mention} is excluded from time tracking.")
         return
 
     if not can_clock_in(user_id):
-        await ctx.send(f"{ctx.author.mention}, you cannot clock in at this time. You might already be clocked in, or have clocked out too recently. If you wish to end your current shift, use `!clockout`.")
+        # Specific message depending on whether it's self or another user
+        if target_user == ctx.author:
+            await ctx.send(f"{ctx.author.mention}, you cannot clock in at this time. You might already be clocked in, or have clocked out too recently. If you wish to end your current shift, use `!clockout`.")
+        else:
+            await ctx.send(f"{target_user.mention} cannot be clocked in at this time. They might already be clocked in, or have clocked out too recently.")
         return
 
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    
+
     try:
-        sheet.append_row([ctx.author.name, "Clock In", timestamp_str])
+        sheet.append_row([target_name, "Clock In", timestamp_str])
     except Exception as e:
-        await ctx.send(f"Failed to log your clock-in to Google Sheets. Please contact an admin. Error: {e}")
-        print(f"Failed to append manual clock-in to Google Sheets for {ctx.author.name}: {e}")
+        await ctx.send(f"Failed to log {target_name}'s clock-in to Google Sheets. Please contact an admin. Error: {e}")
+        print(f"Failed to append manual clock-in to Google Sheets for {target_name}: {e}")
         return
 
-    active_shifts[user_id] = timestamp_str
-    save_active_shift_db(user_id, timestamp_str)
+    active_shifts[user_id] = {'clock_in': timestamp_str, 'guild_id': guild_id}
+    save_active_shift_db(user_id, timestamp_str, guild_id)
 
-    await ctx.send(f"{ctx.author.mention} clocked in at {timestamp_str}")
+    if target_user == ctx.author:
+        await ctx.send(f"{ctx.author.mention} clocked in at {timestamp_str}.")
+    else:
+        await ctx.send(f"{target_user.mention} has been manually clocked in by {ctx.author.mention} at {timestamp_str}.")
 
 @bot.command()
 async def clockout(ctx):
@@ -236,7 +282,7 @@ async def clockout(ctx):
 
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    
+
     was_active = user_id in active_shifts # Check if they were active BEFORE modification
 
     # Log clock-out in Google Sheets
@@ -251,7 +297,7 @@ async def clockout(ctx):
     if was_active: # Only delete if it was present
         del active_shifts[user_id]
         remove_active_shift_db(user_id)
-    
+
     last_clockouts[user_id] = timestamp_str
     save_last_clockout_db(user_id, timestamp_str)
 
@@ -267,14 +313,19 @@ async def auto_clockout_expired_shifts():
     now = datetime.now(ph_tz)
     expired = []
 
-    for uid, clock_in_str in list(active_shifts.items()):
+    # Iterate over a copy because we'll be modifying the dictionary
+    for uid, shift_info in list(active_shifts.items()):
+        # Handle cases where guild_id might be None (from pre-migration entries)
+        clock_in_str = shift_info['clock_in']
+        guild_id = shift_info.get('guild_id') # Use .get() to safely handle missing 'guild_id' key if somehow present
+
         clock_in_time = ph_tz.localize(datetime.strptime(clock_in_str, "%Y-%m-%d %H:%M:%S"))
-        
+
         if now - clock_in_time >= timedelta(hours=14):
             user = bot.get_user(uid)
             name = user.name if user else f"User ID: {uid}"
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-            
+
             try:
                 sheet.append_row([name, "Clock Out (Auto)", timestamp_str])
             except Exception as e:
@@ -282,24 +333,50 @@ async def auto_clockout_expired_shifts():
 
             last_clockouts[uid] = timestamp_str
             save_last_clockout_db(uid, timestamp_str)
-            
+
             expired.append(uid)
-            
+
             if user:
-                for guild in bot.guilds:
-                    member = guild.get_member(uid)
-                    if member:
-                        target_channel = guild.system_channel or \
-                                         discord.utils.get(guild.text_channels, name='general') or \
-                                         (guild.text_channels[0] if guild.text_channels else None)
-                        if target_channel:
-                            try:
-                                await target_channel.send(f"{user.mention} was automatically clocked out after 14 hours.")
-                            except discord.Forbidden:
-                                print(f"Cannot send message to {target_channel.name} in {guild.name}.")
-                            break
+                # If guild_id is known, try to send message to that specific guild
+                if guild_id:
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        member = guild.get_member(uid)
+                        if member:
+                            target_channel = guild.system_channel or \
+                                             discord.utils.get(guild.text_channels, name='general') or \
+                                             (guild.text_channels[0] if guild.text_channels else None)
+                            if target_channel:
+                                try:
+                                    await target_channel.send(f"{user.mention} was automatically clocked out after 14 hours.")
+                                except discord.Forbidden:
+                                    print(f"Cannot send message to {target_channel.name} in {guild.name}.")
+                        else:
+                            print(f"User {user.name} (ID: {uid}) not found in guild {guild.name} (ID: {guild_id}) for auto clock-out notification.")
+                    else:
+                        print(f"Could not find Discord guild for ID {guild_id} for auto clock-out notification for user {name}.")
+                else: # Fallback for old entries where guild_id is NULL
+                    # Try to find user in any guild the bot is in and send a message.
+                    # This is less ideal but better than no message.
+                    found_guild_for_message = False
+                    for guild_in_bot in bot.guilds:
+                        member_in_guild = guild_in_bot.get_member(uid)
+                        if member_in_guild:
+                            target_channel = guild_in_bot.system_channel or \
+                                             discord.utils.get(guild_in_bot.text_channels, name='general') or \
+                                             (guild_in_bot.text_channels[0] if guild_in_bot.text_channels else None)
+                            if target_channel:
+                                try:
+                                    await target_channel.send(f"{user.mention} was automatically clocked out after 14 hours. (Guild not identified precisely for this older entry.)")
+                                    found_guild_for_message = True
+                                    break # Only send to one guild if not specific
+                                except discord.Forbidden:
+                                    print(f"Cannot send message to {target_channel.name} in {guild_in_bot.name}.")
+                    if not found_guild_for_message:
+                        print(f"Could not find a guild to send auto clock-out notification for user {name} (ID: {uid}) with missing guild_id.")
             else:
                 print(f"Could not find Discord user for ID {uid} for auto clock-out notification.")
+
 
     for uid in expired:
         del active_shifts[uid]
@@ -328,14 +405,14 @@ async def exclude(ctx, member: discord.Member = None, *, username: str = None):
     if target_user_id in excluded_user_ids:
         await ctx.send(f"{target_user_name} is already excluded.")
         return
-    
+
     save_excluded_user_db(target_user_id)
     excluded_user_ids.add(target_user_id)
-    
+
     if target_user_id in active_shifts:
         del active_shifts[target_user_id]
         remove_active_shift_db(target_user_id)
-    
+
     await ctx.send(f"{target_user_name} has been excluded from time tracking.")
 
 @bot.command()
@@ -361,10 +438,10 @@ async def include(ctx, member: discord.Member = None, *, username: str = None):
     if target_user_id not in excluded_user_ids:
         await ctx.send(f"{target_user_name} is not excluded.")
         return
-    
+
     remove_excluded_user_db(target_user_id)
     excluded_user_ids.remove(target_user_id)
-    
+
     await ctx.send(f"{target_user_name} has been included back in time tracking.")
 
 @bot.command()
@@ -386,14 +463,23 @@ async def listexcluded(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def onduty(ctx):
-    """Show list of users currently clocked in (on duty)."""
-    if not active_shifts:
-        await ctx.send("No users are currently on duty.")
+    """Show list of users currently clocked in (on duty) for the current guild."""
+    guild_id = ctx.guild.id # Get the ID of the guild where the command was issued
+    on_duty_in_guild = {}
+
+    # Filter active_shifts for the current guild
+    for uid, shift_info in active_shifts.items():
+        # Only include entries where guild_id matches the current guild, AND guild_id is not NULL/None
+        if shift_info.get('guild_id') == guild_id:
+            on_duty_in_guild[uid] = shift_info['clock_in']
+
+    if not on_duty_in_guild:
+        await ctx.send("No users are currently on duty in this server.")
         return
 
-    msg = "**Currently on duty:**\n"
-    for uid, clock_in_str in active_shifts.items():
-        user = bot.get_user(uid)
+    msg = "**Currently on duty in this server:**\n"
+    for uid, clock_in_str in on_duty_in_guild.items():
+        user = ctx.guild.get_member(uid) # Try to get member from *current guild*
         name = user.name if user else f"Unknown User (ID: {uid})"
         msg += f"- {name} (clocked in at {clock_in_str})\n"
     await ctx.send(msg)
@@ -405,8 +491,8 @@ async def forceclockout(ctx, member: discord.Member):
     user_id = member.id
     # We remove the check here for flexibility, similar to !clockout
     # if user_id not in active_shifts:
-    #     await ctx.send(f"{member.name} is not currently clocked in.")
-    #     return
+    #    await ctx.send(f"{member.name} is not currently clocked in.")
+    #    return
 
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -424,7 +510,7 @@ async def forceclockout(ctx, member: discord.Member):
     if was_active: # Only delete if it was present
         del active_shifts[user_id]
         remove_active_shift_db(user_id)
-    
+
     last_clockouts[user_id] = timestamp_str
     save_last_clockout_db(user_id, timestamp_str)
 
