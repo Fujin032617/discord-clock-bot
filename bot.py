@@ -144,9 +144,9 @@ def save_last_clockout_db(user_id, timestamp):
 
 # Define intents (permissions your bot needs)
 intents = discord.Intents.default()
-intents.members = True          # Required to get member info (names, IDs)
-intents.message_content = True  # Required to read command messages
-intents.voice_states = True     # Required for tracking voice channel activity (auto clock-in)
+intents.members = True # Required to get member info (names, IDs)
+intents.message_content = True # Required to read command messages
+intents.voice_states = True # Required for tracking voice channel activity (auto clock-in)
 
 # Initialize the bot with a command prefix and intents
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -158,14 +158,21 @@ scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/au
 
 # Load Google service account credentials from an environment variable
 # This environment variable (e.g., GOOGLE_CREDS) should contain the JSON key file content as a string.
-creds_json = json.loads(os.environ['GOOGLE_CREDS'])
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
-client = gspread.authorize(creds)
+try:
+    creds_json = json.loads(os.environ['GOOGLE_CREDS'])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+    client = gspread.authorize(creds)
 
-# Open your specific Google Sheet by name
-# IMPORTANT: Replace "Employee Time Log" with the exact name of your Google Sheet.
-# Also, ensure the service account email has "Editor" access to this Google Sheet.
-sheet = client.open("Employee Time Log").sheet1 # Assuming you want to interact with the first sheet
+    # Open your specific Google Sheet by name
+    # IMPORTANT: Replace "Employee Time Log" with the exact name of your Google Sheet.
+    # Also, ensure the service account email has "Editor" access to this Google Sheet.
+    sheet = client.open("Employee Time Log").sheet1 # Assuming you want to interact with the first sheet
+except KeyError:
+    print("WARNING: GOOGLE_CREDS environment variable not found. Google Sheets functionality will be disabled.")
+    sheet = None # Set sheet to None so subsequent calls will fail gracefully
+except Exception as e:
+    print(f"ERROR: Failed to connect to Google Sheets. Error: {e}")
+    sheet = None
 
 # --- 5. In-Memory Data Storage (Loaded from DB) ---
 
@@ -217,47 +224,107 @@ def can_clock_in(user_id):
 
     return True # All checks pass, the user is eligible to clock in
 
+# Helper function for logging to Google Sheets
+def log_to_google_sheets(user_name, action, timestamp_str):
+    if sheet:
+        try:
+            sheet.append_row([user_name, action, timestamp_str])
+            print(f"Logged {action} for {user_name} at {timestamp_str}")
+            return True
+        except Exception as e:
+            print(f"Failed to append {action} to Google Sheets for {user_name}: {e}")
+            return False
+    else:
+        print(f"Skipped logging {action} for {user_name} due to Google Sheets not being configured.")
+        return False
+
+# Helper function to send notification messages
+async def send_notification(member, message):
+    if not member or not member.guild:
+        return
+
+    # Try system channel, then 'general', then any available text channel
+    channel_to_send = member.guild.system_channel or \
+                      discord.utils.get(member.guild.text_channels, name='general') or \
+                      (member.guild.text_channels[0] if member.guild.text_channels else None)
+
+    if channel_to_send:
+        try:
+            await channel_to_send.send(message)
+        except discord.Forbidden:
+            print(f"Cannot send message to {channel_to_send.name} in {member.guild.name} (Forbidden: Bot lacks permissions).")
+
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     """
     Handles automatic clock-in/out based on voice channel activity.
-    Triggers a clock-in when a user joins or moves into a voice channel.
+    Triggers a clock-in when a user joins or moves into a voice channel, and clocks out when they leave.
+    Also handles clock-in/out for muting/deafening.
     """
-    user_id = member.id
-    guild_id = member.guild.id # Get the ID of the guild where the voice state change occurred
-    now = datetime.now(ph_tz)
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
     if member.bot:
         return # Ignore actions by other bots
 
-    if user_id in excluded_user_ids:
-        return # Ignore actions by users in the excluded list
+    user_id = member.id
+    guild_id = member.guild.id
+    now = datetime.now(ph_tz)
+    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Auto Clock-in Logic: When a user joins *any* voice channel (or moves between channels)
-    # This prevents clocking in multiple times if they are already in a voice channel.
-    if after.channel and (before.channel != after.channel):
-        if can_clock_in(user_id): # Check if the user is eligible to clock in based on rules
+    # Ignore actions by users in the excluded list
+    if user_id in excluded_user_ids:
+        return
+
+    # Case 1: User joins a voice channel or moves between channels
+    if after.channel and not before.channel:
+        # Check if they are not muted or deafened, and are eligible to clock in
+        if not after.self_deaf and not after.self_mute and can_clock_in(user_id):
+            print(f"Attempting to clock in {member.name} due to joining a voice channel.")
             # Record the clock-in time and the guild ID
             active_shifts[user_id] = {'clock_in': timestamp_str, 'guild_id': guild_id}
-            save_active_shift_db(user_id, timestamp_str, guild_id) # Persist to SQLite DB
+            save_active_shift_db(user_id, timestamp_str, guild_id)
+            if log_to_google_sheets(member.name, "Clock In (Auto)", timestamp_str):
+                await send_notification(member, f"✅ {member.mention} has automatically clocked in (joined voice channel).")
+        else:
+            print(f"Skipping auto clock-in for {member.name}. Reason: Muted/deafened or not eligible.")
 
-            try:
-                # Log the auto clock-in to Google Sheets
-                sheet.append_row([member.name, "Clock In", timestamp_str])
-                print(f"Logged auto clock-in for {member.name} at {timestamp_str}")
-            except Exception as e:
-                print(f"Failed to append auto clock-in to Google Sheets for {member.name}: {e}")
+    # Case 2: User leaves a voice channel
+    elif before.channel and not after.channel:
+        # If the user had an active shift recorded by the bot
+        if user_id in active_shifts:
+            print(f"Attempting to clock out {member.name} due to leaving a voice channel.")
+            # Log the clock-out event
+            log_to_google_sheets(member.name, "Clock Out (Auto)", timestamp_str)
+            # Remove the shift from memory and DB
+            del active_shifts[user_id]
+            remove_active_shift_db(user_id)
+            # Update the last clockout time for cooldown
+            last_clockouts[user_id] = timestamp_str
+            save_last_clockout_db(user_id, timestamp_str)
+            await send_notification(member, f"🛑 {member.mention} has automatically clocked out (left voice channel).")
+    
+    # Case 3: User Mutes/Deafens themselves while in a channel (considered 'not on duty')
+    elif after.channel and (after.self_deaf or after.self_mute) and (not before.self_deaf and not before.self_mute):
+        if user_id in active_shifts:
+            print(f"Attempting to clock out {member.name} due to muting/deafening.")
+            # Log the clock-out event
+            log_to_google_sheets(member.name, "Clock Out (Auto)", timestamp_str)
+            # Remove the shift from memory and DB
+            del active_shifts[user_id]
+            remove_active_shift_db(user_id)
+            # Update the last clockout time for cooldown
+            last_clockouts[user_id] = timestamp_str
+            save_last_clockout_db(user_id, timestamp_str)
+            await send_notification(member, f"🛑 {member.mention} has automatically clocked out (muted/deafened).")
+    
+    # Case 4: User Unmutes/Undeafens themselves while in a channel (considered 'on duty')
+    elif after.channel and (not after.self_deaf and not after.self_mute) and (before.self_deaf or before.self_mute):
+        if can_clock_in(user_id):
+            print(f"Attempting to clock in {member.name} due to unmuting/undeafening.")
+            # Record the clock-in time and the guild ID
+            active_shifts[user_id] = {'clock_in': timestamp_str, 'guild_id': guild_id}
+            save_active_shift_db(user_id, timestamp_str, guild_id)
+            if log_to_google_sheets(member.name, "Clock In (Auto)", timestamp_str):
+                await send_notification(member, f"✅ {member.mention} has automatically clocked in (unmuted/undeafened).")
 
-            # Send a notification message to a visible channel in the guild
-            channel_to_send = member.guild.system_channel or \
-                              discord.utils.get(member.guild.text_channels, name='general') or \
-                              (member.guild.text_channels[0] if member.guild.text_channels else None)
-            if channel_to_send:
-                try:
-                    await channel_to_send.send(f"✅ {member.mention} has automatically clocked in (joined voice channel).")
-                except discord.Forbidden:
-                    print(f"Cannot send message to {channel_to_send.name} in {member.guild.name} (Forbidden: Bot lacks permissions).")
 
 # --- 7. Discord Bot Commands ---
 
@@ -302,13 +369,9 @@ async def clockin(ctx, member: discord.Member = None, *, username: str = None):
     now = datetime.now(ph_tz)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    try:
-        # Log the manual clock-in to Google Sheets
-        sheet.append_row([target_name, "Clock In", timestamp_str])
-        print(f"Logged manual clock-in for {target_name} at {timestamp_str}")
-    except Exception as e:
-        await ctx.send(f"❌ Failed to log {target_name}'s clock-in to Google Sheets. Please contact an admin. Error: {e}")
-        print(f"Failed to append manual clock-in to Google Sheets for {target_name}: {e}")
+    # Try to log to Google Sheets first
+    if not log_to_google_sheets(target_name, "Clock In", timestamp_str):
+        await ctx.send(f"❌ Failed to log {target_name}'s clock-in to Google Sheets. Please contact an admin.")
         return # Stop execution if Google Sheet logging fails
 
     # Store the active shift in memory and persist to DB
@@ -458,13 +521,9 @@ async def forceclockout(ctx, member: discord.Member):
     # Check if the user was considered active by the bot before processing
     was_active = user_id in active_shifts
 
-    try:
-        # Log the force clock-out to Google Sheets
-        sheet.append_row([user_name, "Clock Out (Force)", timestamp_str])
-        print(f"Logged force clock-out for {user_name} at {timestamp_str}")
-    except Exception as e:
-        await ctx.send(f"❌ Failed to log force clock-out to Google Sheets. Please contact an admin. Error: {e}")
-        print(f"Failed to append force clock-out to Google Sheets for {user_name}: {e}")
+    # Log the force clock-out to Google Sheets
+    if not log_to_google_sheets(user_name, "Clock Out (Force)", timestamp_str):
+        await ctx.send(f"❌ Failed to log force clock-out to Google Sheets. Please contact an admin.")
         return # Stop execution if Google Sheet logging fails
 
     # If they were active, remove their shift from active_shifts and DB
@@ -503,13 +562,9 @@ async def clockout(ctx):
     # Check if the user was considered active by the bot before processing
     was_active = user_id in active_shifts
 
-    try:
-        # Log the manual clock-out to Google Sheets
-        sheet.append_row([user_name, "Clock Out", timestamp_str])
-        print(f"Logged manual clock-out for {user_name} at {timestamp_str}")
-    except Exception as e:
-        await ctx.send(f"❌ Failed to log your clock-out to Google Sheets. Please contact an admin. Error: {e}")
-        print(f"Failed to append manual clock-out to Google Sheets for {user_name}: {e}")
+    # Log the manual clock-out to Google Sheets
+    if not log_to_google_sheets(user_name, "Clock Out", timestamp_str):
+        await ctx.send(f"❌ Failed to log your clock-out to Google Sheets. Please contact an admin.")
         return # Stop execution if Google Sheet logging fails
 
     # If they were active, remove their shift from active_shifts and DB
@@ -564,9 +619,9 @@ async def status(ctx):
                 display_time = last_out_time.strftime("%I:%M %p on %B %d, %Y")
                 await ctx.send(f"🔴 {ctx.author.mention}, you are currently **Clocked Out**. Your last recorded clock-out was at {display_time}.")
             except ValueError:
-                 # Handle cases where the last clock-out string might be malformed
-                 await ctx.send(f"🔴 {ctx.author.mention}, you are currently **Clocked Out**. (Last clock-out time data unavailable or corrupted.)")
-                 print(f"Error parsing last_out_time for user {user_id}: {last_out_str}")
+                    # Handle cases where the last clock-out string might be malformed
+                    await ctx.send(f"🔴 {ctx.author.mention}, you are currently **Clocked Out**. (Last clock-out time data unavailable or corrupted.)")
+                    print(f"Error parsing last_out_time for user {user_id}: {last_out_str}")
         else:
             # No clock-in or clock-out records found for the user at all
             await ctx.send(f"🔴 {ctx.author.mention}, you are currently **Clocked Out**. (No previous clock-in/out records found.)")
@@ -611,12 +666,8 @@ async def auto_clockout_expired_shifts():
             name = user.name if user else f"User ID: {uid}" # Fallback name if user object not found
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-            try:
-                # Log the auto clock-out event to Google Sheets
-                sheet.append_row([name, "Clock Out (Auto)", timestamp_str])
-                print(f"Logged auto clock-out for {name} at {timestamp_str}")
-            except Exception as e:
-                print(f"Failed to append auto clock-out to Google Sheets for {name}: {e}")
+            # Log the auto clock-out event to Google Sheets
+            log_to_google_sheets(name, "Clock Out (Auto)", timestamp_str)
 
             # Update last_clockouts for cooldown purposes and persist
             last_clockouts[uid] = timestamp_str
@@ -631,15 +682,7 @@ async def auto_clockout_expired_shifts():
                     if guild:
                         member = guild.get_member(uid) # Get guild-specific member object
                         if member:
-                            # Try system channel, then 'general', then any available text channel
-                            target_channel = guild.system_channel or \
-                                             discord.utils.get(guild.text_channels, name='general') or \
-                                             (guild.text_channels[0] if guild.text_channels else None)
-                            if target_channel:
-                                try:
-                                    await target_channel.send(f"⚠️ {user.mention} was automatically clocked out after 14 hours. Please remember to `!clockout` manually at the end of your shift.")
-                                except discord.Forbidden:
-                                    print(f"Cannot send message to {target_channel.name} in {guild.name} (Forbidden: Bot lacks permissions).")
+                            await send_notification(member, f"⚠️ {user.mention} was automatically clocked out after 14 hours. Please remember to `!clockout` manually at the end of your shift.")
                         else:
                             print(f"User {user.name} (ID: {uid}) not found as member in guild {guild.name} (ID: {guild_id}) for auto clock-out notification.")
                     else:
@@ -649,16 +692,9 @@ async def auto_clockout_expired_shifts():
                     for guild_in_bot in bot.guilds:
                         member_in_guild = guild_in_bot.get_member(uid)
                         if member_in_guild:
-                            target_channel = guild_in_bot.system_channel or \
-                                             discord.utils.get(guild_in_bot.text_channels, name='general') or \
-                                             (guild_in_bot.text_channels[0] if guild_in_bot.text_channels else None)
-                            if target_channel:
-                                try:
-                                    await target_channel.send(f"⚠️ {user.mention} was automatically clocked out after 14 hours. Please remember to `!clockout` manually at the end of your shift.")
-                                    found_guild_for_message = True
-                                    break # Only send to one guild if not specific
-                                except discord.Forbidden:
-                                    print(f"Cannot send message to {target_channel.name} in {guild_in_bot.name} (Forbidden: Bot lacks permissions).")
+                            await send_notification(member_in_guild, f"⚠️ {user.mention} was automatically clocked out after 14 hours. Please remember to `!clockout` manually at the end of your shift.")
+                            found_guild_for_message = True
+                            break # Only send to one guild if not specific
                     if not found_guild_for_message:
                         print(f"Could not find a guild to send auto clock-out notification for user {name} (ID: {uid}) with missing guild_id.")
             else:
